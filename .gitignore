@@ -1,0 +1,11 @@
+# Ignore the data folder (keep your CSVs local)
+data/
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore environment folders
+env/
+venv/
+.DS_Store
