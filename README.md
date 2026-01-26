@@ -16,6 +16,14 @@ The TESS mission provides time-series photometry for millions of stars. Analyzin
 * **Alias Checking:** Validates candidates by folding data at $2 \times P$ to distinguish between Primary/Secondary eclipses and identify Contact Binaries (W UMa types).
 * **SNR Calculation:** Implements robust Signal-to-Noise Ratio estimation to rank candidates by reliability.
 
+## 💾 Data Management
+
+To ensure scientific reproducibility, this pipeline includes an automated backup system.
+
+* **Automatic Storage:** When a strong candidate is detected or validated, the processed light curve (CSV format) and validation plots (PNG format) are automatically saved to a local `data/` directory.
+* **Provenance:** These files satisfy requirements for submission to databases like VSX, which may request the specific photometry used to determine the period and epoch.
+* **Git Policy:** The `data/` folder is included in `.gitignore` to prevent bloating the repository size, but users are encouraged to archive these files locally.
+
 ## 🚀 Discoveries
 
 This pipeline has been successfully used to identify previously uncatalogued variable systems.
