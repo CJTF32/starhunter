@@ -1,8 +1,8 @@
 """
 TESS Variable Star Hunter Pipeline
-Version: 1.0.0
+Version: 1.1.0 (With Data Backup)
 Author: [Your Name/GitHub Handle]
-Description: Automated pipeline to detect and validate Eclipsing Binaries in TESS Sector data.
+Description: Automated pipeline to detect, validate, and backup Eclipsing Binaries in TESS Sector data.
 """
 
 import lightkurve as lk
@@ -13,6 +13,7 @@ from astropy.coordinates import SkyCoord
 import astropy.units as u
 import pandas as pd
 import warnings
+import os
 
 # Suppress minor warnings for cleaner output
 warnings.filterwarnings("ignore")
@@ -22,6 +23,11 @@ SECTOR_TO_SCAN = 55
 SEARCH_COORDS = SkyCoord(ra=270.0, dec=60.0, unit=(u.deg, u.deg)) # Draco
 SEARCH_RADIUS = 0.5 * u.deg
 MAGNITUDE_RANGE = [10, 13]  # Tmag
+
+# Ensure data directory exists
+DATA_DIR = "data"
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR)
 
 def fetch_targets():
     """Step 1: Fetch a list of stars from the MAST Catalog."""
@@ -63,13 +69,12 @@ def run_bls_analysis(lc, target_id):
     return best_period, best_t0, max_power, snr, clean_lc
 
 def validate_candidate(target_id, sector=None):
-    """Step 3: Deep Dive Validation with Alias Check."""
+    """Step 3: Deep Dive Validation with Alias Check & Data Backup."""
     print(f"\n🔬 STARTING DEEP DIVE: TIC {target_id}")
     
     try:
         search = lk.search_lightcurve(f"TIC {target_id}", mission="TESS", sector=sector)
         if len(search) == 0:
-            # Fallback to any sector if specific one not found
             search = lk.search_lightcurve(f"TIC {target_id}", mission="TESS")
             
         if len(search) == 0:
@@ -82,6 +87,11 @@ def validate_candidate(target_id, sector=None):
         print(f"   > Period: {period:.5f} d")
         print(f"   > Power:  {power:.1f}")
         print(f"   > SNR:    {snr:.2f}")
+
+        # --- SAVE DATA ---
+        filename_base = f"{DATA_DIR}/TIC_{target_id}_S{search.table['sector'][0]}"
+        clean_lc.to_csv(f"{filename_base}_processed.csv", overwrite=True)
+        print(f"   💾 Light curve saved to {filename_base}_processed.csv")
 
         # Visualization
         fig, ax = plt.subplots(1, 2, figsize=(14, 5))
@@ -101,8 +111,12 @@ def validate_candidate(target_id, sector=None):
         ax[1].set_xlabel("Phase")
         
         plt.tight_layout()
+        
+        # Save Plot
+        plt.savefig(f"{filename_base}_validation.png")
+        print(f"   💾 Plot saved to {filename_base}_validation.png")
+        
         plt.show()
-        print("✅ Validation Complete. Check plot for Primary/Secondary eclipses.")
         
     except Exception as e:
         print(f"⚠️ Error: {e}")
@@ -112,7 +126,7 @@ def batch_process():
     targets = fetch_targets()
     print("\n--- STARTING BATCH SCAN ---")
     
-    for i, tic in enumerate(targets[:100]): # Limit to 100 for demo
+    for i, tic in enumerate(targets[:100]): 
         try:
             search = lk.search_lightcurve(f"TIC {tic}", mission="TESS", sector=SECTOR_TO_SCAN)
             if len(search) == 0: continue
@@ -121,26 +135,23 @@ def batch_process():
             period, t0, power, snr, clean_lc = run_bls_analysis(lc, tic)
             
             # --- FILTERING ---
-            # 1. Ignore weak signals
             if power < 150: continue
-            
-            # 2. Ignore 7-day satellite glitches
-            if 6.8 < period < 7.2:
-                continue 
+            if 6.8 < period < 7.2: continue 
             
             print(f"[{i+1}] TIC {tic} | P: {period:.4f} d | Power: {power:.0f} | SNR: {snr:.1f}")
             print("   🌟 STRONG CANDIDATE DETECTED!")
             
-            # Quick look plot for candidate
-            clean_lc.fold(period, t0).scatter(label=f"TIC {tic}")
-            plt.show()
+            # --- AUTO-BACKUP FOR CANDIDATES ---
+            csv_path = f"{DATA_DIR}/TIC_{tic}_S{SECTOR_TO_SCAN}_candidate.csv"
+            clean_lc.to_csv(csv_path, overwrite=True)
+            print(f"   💾 Data backed up to {csv_path}")
             
         except Exception as e:
             continue
 
-# --- MAIN MENU ---
 if __name__ == "__main__":
-    print("=== TESS VARIABLE STAR HUNTER ===")
+    print("=== TESS VARIABLE STAR HUNTER (v1.1) ===")
+    print(f"📂 Data will be saved to: ./{DATA_DIR}/")
     print("1. Run Batch Scan (Draco Region)")
     print("2. Validate Known Discovery")
     
