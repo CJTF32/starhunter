@@ -1,11 +1,13 @@
-# Ignore the data folder (keep your CSVs local)
-data/
+# Ignore the output folder (Don't upload data!)
+candidates_raster/
 
-# Ignore Python cache
+# Ignore Python cache files
 __pycache__/
 *.pyc
 
-# Ignore environment folders
-env/
-venv/
+# Ignore system files
 .DS_Store
+
+# Ignore virtual environments
+venv/
+env/
