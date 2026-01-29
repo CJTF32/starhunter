@@ -1,7 +1,8 @@
+```text
+lightkurve>=2.4.0
 numpy
 matplotlib
-pandas
 astropy
 astroquery
-lightkurve
-scipy
+requests
+pandas
