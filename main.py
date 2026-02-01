@@ -1,193 +1,224 @@
-# ==============================================================================
-# 📦 STEP 0: AUTO-INSTALL DEPENDENCIES
-# ==============================================================================
-import subprocess
+# Deep Sky Surveyor (TESS Variable Star Hunter)
+# Automated systematic scanner for TESS Full Frame Images.
+# Features: Resume capability, Artifact Filtering, Network Retry.
+
+import os
 import sys
+import time
+import json
+import warnings
+import shutil
+import logging
+import requests
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from datetime import datetime
 
-def install(package):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+# --- CONFIGURATION ---
+TARGET_SECTORS = None    # Set to [15, 16] to limit sectors, or None for 'All Available'
+SEARCH_RADIUS = 0.3      # Size of each tile (degrees)
+MAG_RANGE = (9, 13.0)    # TESS Magnitude range
+BATCH_TIME_LIMIT = 3600  # Save and zip every 3600 seconds (1 hour)
+MAX_RETRIES = 3          # Network retry attempts
 
+# Artifact Filtering Constants
+MIN_DEPTH = 0.005        # 0.5% minimum depth
+ALIAS_TOL = 0.01         # Tolerance for integer period artifacts
+
+# Paths
+WORK_DIR = "Survey_Data"
+CHECKPOINT_FILE = os.path.join(WORK_DIR, "checkpoint.json")
+RESULTS_CSV = os.path.join(WORK_DIR, "Candidates_Log.csv")
+
+# --- LIBRARIES ---
+# Late imports to allow setup checks
 try:
     import lightkurve as lk
+    from astropy.timeseries import BoxLeastSquares
+    from astropy import units as u
+    from astroquery.mast import Catalogs
 except ImportError:
-    print("⏳ Installing Lightkurve... (This takes 30 seconds)")
-    install("lightkurve")
-    import lightkurve as lk
-    print("✅ Lightkurve installed.")
+    print("❌ Missing dependencies. Run: pip install -r requirements.txt")
+    sys.exit(1)
 
-# ==============================================================================
-# 🚜 STEP 1: CONFIGURATION (HIGH SENSITIVITY MODE)
-# ==============================================================================
-import numpy as np
-import matplotlib.pyplot as plt
-import requests
-import os
-import gc
-import time
-from astropy.coordinates import SkyCoord
-from astropy import units as u
-from astroquery.vizier import Vizier
-import warnings
+warnings.simplefilter('ignore')
 
-warnings.filterwarnings("ignore")
+# --- SETUP ENV ---
+if not os.path.exists(WORK_DIR):
+    os.makedirs(WORK_DIR)
 
-# ⚙️ SCAN SETTINGS
-SECTOR = 75              # Northern CVZ (Best Data)
-AUTHOR = "QLP"           # Faint Star Pipeline
+def is_colab():
+    return 'google.colab' in sys.modules
 
-# 🎯 TARGET: North Ecliptic Pole (NEP)
-CENTER_RA = 270.0
-CENTER_DEC = 66.5
-
-# 📏 GRID: 10x10 degrees (100 patches)
-GRID_SIZE = 10  
-STEP_SIZE = 1.0 
-
-STARS_PER_PATCH = 500  
-OUTPUT_FOLDER = "candidates_sensitive"
-RESULTS_FILE = "candidates_sensitive.csv"
-
-# ⚡ FILTERS: SENSITIVE MODE
-# Lowered thresholds to detect Earths/Neptunes and weak signals.
-MIN_SNR = 8.0            # Standard NASA threshold (was 30.0)
-MIN_MAG_DEPTH = 0.005    # 0.5% dip (was 5.0%)
-MAX_DEPTH_FLUX = 0.90    # Exclude obvious Eclipsing Binaries (>90% blocked)
-SUSPICIOUS_PERIODS = [0.5, 1.0, 13.7, 27.4] 
-PERIOD_TOLERANCE = 0.05 
-
-# ==============================================================================
-# 🛠️ HELPER FUNCTIONS
-# ==============================================================================
-def load_forbidden_catalog(url):
-    try:
-        r = requests.get(url)
-        return {line.split()[0] for line in r.text.split('\n') if len(line.split()) > 0 and line.split()[0].isdigit()}
-    except: return set()
-
-def check_vsx(ra, dec):
-    try:
-        v = Vizier(columns=['OID', 'Name', 'Type'], row_limit=1)
-        res = v.query_region(SkyCoord(ra, dec, unit=(u.deg, u.deg)), radius=5*u.arcsec, catalog='B/vsx')
-        if len(res) > 0: return True, res[0]['Name']
-        return False, None
-    except: return False, None
-
-def is_suspicious_period(period):
-    for p in SUSPICIOUS_PERIODS:
-        if abs(period - p) < (p * PERIOD_TOLERANCE): return True
-    return False
-
-def log_candidate(tic, snr, depth, period, ra, dec, status):
-    print(f"\n      🌟 HIT FOUND! TIC {tic} | Depth: {depth:.3f} | SNR: {snr:.1f}")
-    with open(RESULTS_FILE, "a") as f:
-        f.write(f"{tic},{snr:.2f},{depth:.4f},{period:.4f},{ra},{dec},{status}\n")
-
-# ==============================================================================
-# 🚀 MAIN RASTER SCAN
-# ==============================================================================
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-if not os.path.exists(RESULTS_FILE):
-    with open(RESULTS_FILE, "w") as f:
-        f.write("TIC_ID,SNR,Mag_Depth,Period,RA,Dec,Status\n")
-
-blacklist = load_forbidden_catalog("https://content.cld.iop.org/journals/0067-0049/279/2/50/revision1/apjsade2d8t3_mrt.txt")
-
-print(f"\n🚜 STARTING HIGH-SENSITIVITY SCAN: SECTOR {SECTOR}")
-print(f"   Center: RA {CENTER_RA}, Dec {CENTER_DEC}")
-print(f"   Grid: {GRID_SIZE}x{GRID_SIZE} Patches.")
-
-total_scanned = 0
-patch_count = 0
-
-for i in range(GRID_SIZE):
-    current_dec = CENTER_DEC - (GRID_SIZE/2 * STEP_SIZE) + (i * STEP_SIZE)
-    
-    for j in range(GRID_SIZE):
-        current_ra = CENTER_RA - (GRID_SIZE/2 * STEP_SIZE) + (j * STEP_SIZE)
-        patch_count += 1
+# --- STATE MANAGEMENT ---
+def load_state():
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE, 'r') as f:
+            return json.load(f)
+    else:
+        # Generate Grid (Global Sky)
+        ra_steps = np.arange(0, 360, 2)    # Every 2 deg RA
+        dec_steps = np.arange(-80, 80, 2)  # Every 2 deg DEC
+        tiles = [f"{r}_{d}" for r in ra_steps for d in dec_steps]
         
-        print(f"\n📍 Patch {patch_count}/{GRID_SIZE*GRID_SIZE} | Coord: {current_ra:.1f}, {current_dec:.1f}")
-        
-        # RETRY LOGIC
-        manifest = None
-        for attempt in range(3):
+        return {
+            "tiles_total": len(tiles),
+            "current_tile_index": 0,
+            "candidates_found": 0,
+            "start_time": time.time(),
+            "tiles_list": tiles
+        }
+
+def save_state(state):
+    with open(CHECKPOINT_FILE, 'w') as f:
+        json.dump(state, f)
+
+# --- ANALYSIS ENGINE ---
+def is_artifact(period, depth):
+    """Returns True if signal is likely noise/alias."""
+    if depth < MIN_DEPTH: return True, "Shallow"
+    if abs(period - round(period)) < ALIAS_TOL: return True, "Integer Artifact"
+    if abs((period % 1) - 0.5) < ALIAS_TOL: return True, "0.5d Alias"
+    if period < 0.6 or period > 14.0: return True, "Grid Edge"
+    return False, "Clean"
+
+def analyze_star(tic_id):
+    try:
+        # 1. Search (With Retry)
+        search = None
+        for _ in range(MAX_RETRIES):
             try:
-                manifest = lk.search_lightcurve(
-                    SkyCoord(current_ra, current_dec, unit=u.deg),
-                    radius=0.7*u.deg, 
-                    sector=SECTOR,
-                    limit=STARS_PER_PATCH,
-                    author=AUTHOR
-                )
+                search = lk.search_lightcurve(f"TIC {tic_id}", mission="TESS", sector=TARGET_SECTORS)
                 break
-            except Exception as e:
-                print(f"   ⚠️ Network blip: {e}")
-                time.sleep(5)
+            except: time.sleep(2)
         
-        if manifest is None or len(manifest) == 0:
-            print("   ❌ Gap. Skipping.")
-            continue
-            
-        print(f"   📥 Processing {len(manifest)} stars", end="")
+        if not search or len(search) == 0: return "No Data"
 
-        count = 0
-        for target in manifest:
-            count += 1
-            if count % 20 == 0: print(".", end="", flush=True)
-
+        # 2. Download
+        lc = None
+        for _ in range(MAX_RETRIES):
             try:
-                tic_id = str(target.target_name).replace("TIC", "").strip()
-                if tic_id in blacklist: continue 
+                lc = search[0].download(quality_bitmask='default')
+                break
+            except: time.sleep(2)
+            
+        if lc is None: return "Download Fail"
+        if np.nanmedian(lc.flux.value) <= 0: return "Bad Flux"
 
-                try:
-                    lc_coll = target.download_all()
-                    if not lc_coll: continue
-                    lc = lc_coll.stitch().remove_nans()
-                    lc = lc.normalize()
-                except: continue
+        # 3. Clean & Bin
+        lc = lc.normalize().remove_nans().remove_outliers(sigma=4)
+        lc_binned = lc.bin(time_bin_size=30*u.min)
+        t, y, dy = lc_binned.time.value, lc_binned.flux.value, lc_binned.flux_err.value
 
-                # BLS
-                model = lc.to_periodogram(method='bls', period=np.arange(0.3, 15.0, 0.005))
-                snr = model.snr
-                depth_flux = model.depth_at_max_power.value 
-                period = model.period_at_max_power.value
-
-                if depth_flux >= 1.0 or depth_flux <= 0: continue 
-                mag_depth = -2.5 * np.log10(1 - depth_flux)
-                
-                # FILTERS
-                if snr < MIN_SNR: continue 
-                if mag_depth < MIN_MAG_DEPTH: continue 
-                if depth_flux > MAX_DEPTH_FLUX: continue 
-                if is_suspicious_period(period): continue 
-
-                # VSX
-                ra_obj = lc.meta['RA_OBJ']
-                dec_obj = lc.meta['DEC_OBJ']
-                is_known, name = check_vsx(ra_obj, dec_obj)
-                if is_known: continue
-
-                # SAVE
-                log_candidate(tic_id, snr, mag_depth, period, ra_obj, dec_obj, "SENSITIVE_HIT")
-
-                # PLOT
-                folded = lc.fold(period=period)
-                binned = folded.bin(time_bin_size=0.02)
-                plt.figure(figsize=(10, 6))
-                plt.plot(folded.time.value, folded.flux.value, 'k.', alpha=0.1, ms=2)
-                plt.plot(binned.time.value, binned.flux.value, 'r-', lw=2, label=f"P={period:.3f}d")
-                plt.title(f"TIC {tic_id} | Depth: {mag_depth:.3f}m | SNR: {snr:.1f}")
-                plt.legend()
-                plt.savefig(f"{OUTPUT_FOLDER}/TIC_{tic_id}.png")
-                plt.close()
-                
-                del lc, model
-
-            except Exception:
-                continue
+        # 4. BLS Search
+        period_grid = np.linspace(0.6, 14, 40000)
+        durations = np.linspace(0.04, 0.15, 10)
         
-        total_scanned += len(manifest)
-        print(f"\n   ✅ Patch Done. Total Scanned: {total_scanned}")
-        gc.collect()
+        model = BoxLeastSquares(t, y, dy=dy)
+        pg = model.power(period_grid, durations)
+        
+        best_idx = np.argmax(pg.power)
+        best_p = pg.period[best_idx]
+        depth = pg.depth[best_idx]
 
-print("🏁 RASTER SCAN COMPLETE.")
+        # 5. Filter
+        is_bad, reason = is_artifact(best_p, depth)
+        if is_bad: return f"Filtered: {reason}"
+
+        # 6. Save Candidate
+        best_t0 = pg.transit_time[best_idx]
+        epoch = best_t0 + 2457000.0
+        
+        # Generate Plot
+        fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+        ax[0].scatter(t, y, s=1, c='k', alpha=0.3)
+        ax[0].set_title(f"TIC {tic_id}")
+        
+        folded = lc.fold(period=best_p, epoch_time=best_t0)
+        folded.scatter(ax=ax[1], s=1, c='purple', alpha=0.5)
+        ax[1].set_title(f"P={best_p:.4f} d | D={depth:.1%}")
+        
+        plot_path = os.path.join(WORK_DIR, f"TIC_{tic_id}_P{best_p:.2f}.png")
+        plt.tight_layout()
+        plt.savefig(plot_path)
+        plt.close()
+
+        return {
+            "TIC": tic_id, "RA": lc.ra, "DEC": lc.dec,
+            "Period": best_p, "Epoch": epoch, "Depth": depth
+        }
+
+    except Exception as e:
+        return "Error"
+
+# --- MAIN EXECUTION ---
+def main():
+    print("🔭 Deep Sky Surveyor Initialized.")
+    state = load_state()
+    
+    # Init CSV
+    if not os.path.exists(RESULTS_CSV):
+        with open(RESULTS_CSV, "w") as f: 
+            f.write("TIC,RA,DEC,Period,Epoch,Depth\n")
+
+    tiles = state['tiles_list']
+    start_time = time.time()
+    batch_start = time.time()
+
+    print(f"📍 Resuming at Tile {state['current_tile_index']}/{state['tiles_total']}")
+    print(f"💎 Candidates found so far: {state['candidates_found']}")
+
+    # --- GRID LOOP ---
+    for i in range(state['current_tile_index'], len(tiles)):
+        
+        # Hourly Batch Save
+        if time.time() - batch_start > BATCH_TIME_LIMIT:
+            print(f"\n⏰ Hourly Save Point Reached. Archiving...")
+            shutil.make_archive("Survey_Backup", 'zip', WORK_DIR)
+            if is_colab():
+                from google.colab import files
+                files.download('Survey_Backup.zip')
+            batch_start = time.time()
+
+        # Parse Tile
+        r_str, d_str = tiles[i].split("_")
+        ra, dec = float(r_str), float(d_str)
+
+        try:
+            # Query MAST
+            cat = Catalogs.query_region(f"{ra} {dec}", radius=SEARCH_RADIUS, catalog="TIC")
+            df = cat.to_pandas()
+            df = df[ (df['Tmag'] >= MAG_RANGE[0]) & (df['Tmag'] <= MAG_RANGE[1]) ]
+
+            print(f"\n📡 Scanning Tile RA:{ra} DEC:{dec} ({len(df)} stars)...")
+
+            for j, row in df.iterrows():
+                tic = str(row['ID'])
+                
+                # Polite Rate Limit
+                time.sleep(0.1)
+
+                res = analyze_star(tic)
+
+                if isinstance(res, dict):
+                    print(f"   💎 FOUND! TIC {tic} (P={res['Period']:.4f}d)")
+                    with open(RESULTS_CSV, "a") as f:
+                        f.write(f"{res['TIC']},{res['RA']},{res['DEC']},{res['Period']},{res['Epoch']},{res['Depth']}\n")
+                    state['candidates_found'] += 1
+                else:
+                    # Overwrite line for cleanliness
+                    sys.stdout.write(f"\r   [{j+1}/{len(df)}] TIC {tic}: {res}")
+                    sys.stdout.flush()
+
+        except Exception as e:
+            print(f"\n⚠️ Tile Error: {e}")
+
+        # Update State
+        state['current_tile_index'] = i + 1
+        save_state(state)
+
+    print("\n🏁 Survey Complete.")
+
+if __name__ == "__main__":
+    main()
